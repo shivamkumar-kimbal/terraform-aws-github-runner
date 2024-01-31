@@ -1,0 +1,148 @@
+name: "Deploying a CI/CD for Vayu API written in ASP.NET 4.7 using GitHub Actions and upload the artifacts to Amazon S3"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "develop" ]
+  pull_request:
+    branches: [ "develop" ]
+
+env:
+  AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
+  AZURE_DEVOPS_USERNAME: ${{ secrets.AZURE_DEVOPS_USERNAME }}
+  AZURE_DEVOPS_TOKEN: ${{ secrets.AZURE_DEVOPS_TOKEN }}
+  NUGET_SOURCE_NAME: ${{ secrets.NUGET_SOURCE_NAME }}
+  IIS_FOLDER: ${{ secrets.IIS_FOLDER }}
+  RUNNER_WORK_LOCATION: ${{ secrets.RUNNER_WORK_LOCATION }}
+
+jobs:
+   build:
+
+       runs-on: windows-latest
+       defaults:
+         run:
+           shell: cmd
+
+       steps:
+       - name: Checkout code repository
+         uses: actions/checkout@v3
+      
+       - name: Setup MSBuild
+         uses: microsoft/setup-msbuild@v1
+
+       - name: Setup NuGet
+         uses: NuGet/setup-nuget@v1.0.5
+
+       - name: Add AzureDevops Nuget Source
+         run: nuget sources Add -UserName "${{ env.AZURE_DEVOPS_USERNAME }}" -Password "${{ env.AZURE_DEVOPS_TOKEN }}" -StorePasswordInClearText -Name "${{ env.NUGET_SOURCE_NAME }}" -Source "https://pkgs.dev.azure.com/wfmindia/161f0b11-e754-46ad-976b-adb3584f708a/_packaging/hes-artifacts/nuget/v3/index.json"
+        
+       - name: Restore Packages
+         run: nuget restore CrystalHESAPISolution.sln
+
+       - name: Replace values in Web.config file with secrets
+         uses: cschleiden/replace-tokens@v1
+         with:
+           tokenPrefix: '___'
+           tokenSuffix: '___'
+           files: '["**/Web.config"]'
+         env:
+           CRYSTALHES_BROKER_PORT: ${{ secrets.CRYSTALHES_BROKER_PORT }}
+           CRYSTALHES_BROKER_HOST: ${{ secrets.CRYSTALHES_BROKER_HOST }}
+           CRYSTALHES_BROKER_PASSWORD: ${{ secrets.CRYSTALHES_BROKER_PASSWORD }}
+           CRYSTALHES_BROKER_USERNAME: ${{ secrets.CRYSTALHES_BROKER_USERNAME }}
+           CRYSTALHES_SECURE_BROKER: ${{ secrets.CRYSTALHES_SECURE_BROKER }}
+           CRYSTALHES_VEEE_ENABLED: ${{ secrets.CRYSTALHES_VEEE_ENABLED }}
+           SMS_API_KEY: ${{ secrets.SMS_API_KEY }}
+           SMS_SENDER: ${{ secrets.SMS_SENDER }}
+           DB_SERVER: ${{ secrets.DB_SERVER }}
+           DB_USER_ID: ${{ secrets.DB_USER_ID }}
+           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+           DB_NAME: ${{ secrets.DB_NAME }}
+
+       - name: Build solution
+         run: msbuild CrystalHESAPISolution.sln /p:Configuration=Release /p:DeployOnBuild=true /p:AutoParameterizationWebConfigConnectionStrings=False
+      
+       - name: Set AWS credentials
+         uses: aws-actions/configure-aws-credentials@v1
+         with:
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+           aws-region: ${{ secrets.AWS_REGION }}
+            
+       - name: Retrieve Commit SHA for the build
+         shell: powershell
+         run: |
+           $output = git rev-parse --short=4 HEAD
+           echo $output
+           echo $output > commit_sha.txt
+                
+       - name: Upload artifacts to Amazon S3
+         shell: powershell
+         env:
+          BUILD: ${{ secrets.BUILD }}
+         run: |
+           aws s3 cp ${{ env.BUILD }} s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/
+           aws s3 cp commit_sha.txt s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/
+  
+
+   deploy:
+    needs: build
+    runs-on: [ self-hosted, Windows, X64, develop ]
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+    - name: Set AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Download the zip file from S3 to EC2 folder
+      shell: powershell
+      run: |
+        C:\"Program Files"\Amazon\AWSCLIV2\aws s3 cp s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/CrystalHES.API.zip ${{ env.RUNNER_WORK_LOCATION }}
+        
+    - name: Unzipping the Zip file
+      shell: powershell
+      run: Expand-Archive -Path ${{ env.RUNNER_WORK_LOCATION }}\CrystalHES.API.zip -DestinationPath ${{ env.RUNNER_WORK_LOCATION }}\output
+    
+  # Deploy to IIS server
+    - name: Stop IIS Server
+      shell: powershell
+      run: iisreset /stop       
+    
+    - name: Delete the IIS folder
+      shell: powershell
+      run: Remove-Item ${{ env.IIS_FOLDER }}\*  -Recurse
+    
+    - name: Copy files to wwwroot folder of IIS server
+      shell: powershell
+      env:
+        EXTRACTED_ZIP_LOCATION: ${{ secrets.EXTRACTED_ZIP_LOCATION }}
+      run: Copy-Item -Path ${{ env.RUNNER_WORK_LOCATION }}\output\${{ env.EXTRACTED_ZIP_LOCATION }}\* -Destination ${{ env.IIS_FOLDER }} -Recurse -Force
+
+    - name: Start IIS Server
+      shell: powershell
+      run: iisreset /start
+
+    - name: Download the Commit SHA file from S3 bucket to EC2 location and rename the artifacts file in S3 bucket
+      shell: powershell
+      run: |
+        C:\"Program Files"\Amazon\AWSCLIV2\aws s3 cp s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/commit_sha.txt ${{ env.RUNNER_WORK_LOCATION }}
+        $output = cat ${{ env.RUNNER_WORK_LOCATION }}\commit_sha.txt
+        C:\"Program Files"\Amazon\AWSCLIV2\aws s3 mv s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/CrystalHES.API.zip s3://${{ env.AWS_BUCKET_NAME  }}/vayu-api/CrystalHES.API-$output.zip
+                
+    - name: Delete the unzipped output folder & zipped file to allow new builds gracefully
+      shell: powershell
+      run: |
+        Remove-Item ${{ env.RUNNER_WORK_LOCATION }}\output -Recurse
+        Remove-Item ${{ env.RUNNER_WORK_LOCATION }}\CrystalHES.API.zip
+            
+    - name: Delete the Commit SHA file from S3 bucket and EC2 instance location 
+      shell: powershell
+      run: |
+        C:\"Program Files"\Amazon\AWSCLIV2\aws s3 rm s3://${{ env.AWS_BUCKET_NAME }}/vayu-api/commit_sha.txt    
+        Remove-Item ${{ env.RUNNER_WORK_LOCATION }}\commit_sha.txt
